@@ -1,0 +1,1770 @@
+#!/usr/bin/env python3
+"""canivt: terminal file manager and text editor with SMB support."""
+# Copyright (C) 2026 Ezequiel Carvalho
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version. See the LICENSE file for details.
+import curses
+import json
+import locale
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import termios
+import time
+import unicodedata
+from urllib.parse import quote, unquote
+
+__version__ = '1.0.0'
+
+locale.setlocale(locale.LC_ALL, '')
+os.environ.setdefault('ESCDELAY', '25')
+
+if os.environ.get('CANIVT_ASCII') != '1':  # needs a Nerd Font
+    IC = dict(root='\uf0a0', home='\uf015', dir='\uf07b', up='\uf148', file='\uf15b', text='\uf15c',
+              code='\uf121', music='\uf001', image='\uf1c5', video='\uf1c8', archive='\uf1c6', pdf='\uf1c1',
+              exec='\uf120', link='\uf0c1', edit='\uf044', warn='\uf071', net='\uf233', share='\uf07c',
+              star='\uf005', sep='\ue0b0')
+else:
+    IC = dict(root='/', home='~', dir='+', up='^', file='-', text='-', code='-', music='-', image='-',
+              video='-', archive='-', pdf='-', exec='*', link='@', edit='*', warn='!', net='@', share='+',
+              star='*', sep='')
+
+AUDIO = set('mp3 flac ogg oga opus wav m4a aac wma aiff aif alac mka ape'.split())
+IMAGE = set('png jpg jpeg gif bmp webp svg ico tif tiff heic avif'.split())
+VIDEO = set('mp4 mkv webm avi mov wmv flv m4v mpg mpeg 3gp'.split())
+ARCHIVE = set('zip tar gz tgz bz2 xz zst 7z rar deb rpm iso jar apk'.split())
+CODE = set('py sh bash zsh fish c h cpp hpp cc cs rs go java kt js mjs ts jsx tsx lua rb php pl '
+           'sql vim html htm css scss sass vue svelte swift dart r jl ex exs hs ml zig nim asm s'.split())
+TEXT = set('txt md markdown rst log csv tsv json jsonc yaml yml toml ini cfg conf config env xml '
+           'desktop service timer rules list properties lock gitignore editorconfig srt sub tex'.split())
+TEXT_NAMES = {'makefile', 'dockerfile', 'readme', 'license', 'changelog', 'todo', 'procfile',
+              'gemfile', 'rakefile', 'vagrantfile'}
+KIND_LABEL = dict(music='música', image='imagem', video='vídeo', archive='arquivo compactado', pdf='PDF')
+
+
+def ext_of(name):
+    return os.path.splitext(name)[1].lower().lstrip('.')
+
+
+def kind_of(name, is_dir, mode):
+    if is_dir:
+        return 'dir'
+    e = ext_of(name)
+    for k, s in (('music', AUDIO), ('image', IMAGE), ('video', VIDEO), ('archive', ARCHIVE), ('code', CODE)):
+        if e in s:
+            return k
+    if e == 'pdf':
+        return 'pdf'
+    if e in TEXT or name.lower() in TEXT_NAMES:
+        return 'text'
+    if mode & 0o111:
+        return 'exec'
+    return 'file'
+
+
+def looks_text(path):
+    try:
+        with open(path, 'rb') as f:
+            b = f.read(8192)
+    except OSError:
+        return False
+    if not b:
+        return True
+    if b'\0' in b:
+        return False
+    for cut in range(4):  # the block may end mid-character
+        try:
+            (b[:len(b) - cut] if cut else b).decode('utf-8')
+            return True
+        except UnicodeDecodeError:
+            continue
+    return False
+
+
+def cw(c):
+    if unicodedata.combining(c):
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in 'WF' else 1
+
+
+def swidth(s):
+    return sum(cw(c) for c in s)
+
+
+def clip(s, w):
+    out, t = [], 0
+    for c in s:
+        x = cw(c)
+        if t + x > w:
+            break
+        out.append(c)
+        t += x
+    return ''.join(out)
+
+
+def safe(s):
+    s = s.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
+    return ''.join(c if c.isprintable() or c == '\t' else '?' for c in s)
+
+
+def put(scr, y, x, s, attr=0):
+    h, w = scr.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    s = clip(s, w - x)
+    try:
+        scr.addstr(y, x, s, attr)
+    except curses.error:
+        pass  # bottom-right cell: written, but curses still raises
+
+
+def fill(scr, y, attr, x=0):
+    h, w = scr.getmaxyx()
+    put(scr, y, x, ' ' * (w - x), attr)
+
+
+def hsize(n):
+    for u in 'BKMGT':
+        if n < 1024:
+            return f'{n:.0f}{u}' if u == 'B' else f'{n:.1f}{u}'
+        n /= 1024
+    return f'{n:.1f}P'
+
+
+# (256-color index, 8-color fallback)
+RED, ORANGE, YELLOW, GREEN = (160, 1), (208, 3), (178, 3), (71, 2)
+CYAN, BLUE, PURPLE = (37, 6), (33, 4), (135, 5)
+GRAY, DARK, SEL, WHITE, BLACK = (244, 7), (236, 0), (237, 0), (255, 7), (16, 0)
+SELTXT = (25, 4)
+CRUMBS = [ORANGE, YELLOW, GREEN, CYAN, BLUE, PURPLE]
+LIGHT_BG = {ORANGE, YELLOW, GREEN, CYAN}
+_pairs = {}
+_rich = True
+
+
+def col(fg, bg=None):
+    f = fg[0 if _rich else 1] if fg else -1
+    b = bg[0 if _rich else 1] if bg else -1
+    if (f, b) not in _pairs:
+        n = len(_pairs) + 1
+        if n >= curses.COLOR_PAIRS:
+            return 0
+        curses.init_pair(n, f, b)
+        _pairs[f, b] = curses.color_pair(n)
+    return _pairs[f, b]
+
+
+KIND_COLOR = dict(dir=BLUE, text=WHITE, code=GREEN, music=PURPLE, image=YELLOW, video=ORANGE,
+                  archive=RED, pdf=RED, exec=GREEN, file=GRAY, link=CYAN)
+
+
+def label(scr, y, x, text, bg, nxt=None):
+    """Draw a powerline-style label; returns the next x."""
+    fg = BLACK if bg in LIGHT_BG else WHITE
+    s = f' {text} '
+    put(scr, y, x, s, col(fg, bg) | curses.A_BOLD)
+    x += swidth(s)
+    if IC['sep']:
+        put(scr, y, x, IC['sep'], col(bg, nxt))
+        x += 1
+    return x
+
+
+def wrap_keys(items, w):
+    rows, row, rw = [], [], 0
+    for k, d in items:
+        cell = swidth(k) + swidth(d) + 5
+        if row and rw + cell > w:
+            rows.append(row)
+            row, rw = [], 0
+        row.append((k, d))
+        rw += cell
+    if row:
+        rows.append(row)
+    return rows
+
+
+def draw_keys(scr, items):
+    """Draw the shortcut bar; returns the rows used."""
+    h, w = scr.getmaxyx()
+    rows = wrap_keys(items, w)
+    for i, row in enumerate(rows):
+        y = h - len(rows) + i
+        fill(scr, y, col(None, DARK))
+        x = 0
+        for k, d in row:
+            put(scr, y, x, f' {k} ', col(BLACK, RED if k != '' else DARK) | curses.A_BOLD)
+            x += swidth(k) + 2
+            put(scr, y, x, f' {d}  ', col(WHITE, DARK))
+            x += swidth(d) + 3
+    return len(rows)
+
+
+def _clip_cmds(write):
+    if os.environ.get('WAYLAND_DISPLAY') and shutil.which('wl-copy'):
+        return [['wl-copy'], ['wl-copy', '-p']] if write else [['wl-paste', '-n']]
+    if os.environ.get('DISPLAY') and shutil.which('xclip'):
+        if write:
+            return [['xclip', '-selection', s] for s in ('clipboard', 'primary')]
+        return [['xclip', '-selection', 'clipboard', '-o']]
+    if os.environ.get('DISPLAY') and shutil.which('xsel'):
+        return [['xsel', '-bi'], ['xsel', '-pi']] if write else [['xsel', '-bo']]
+    return []
+
+
+def clip_set(text):
+    """Copy to the system clipboard and the primary selection."""
+    data = text.encode('utf-8', 'surrogateescape')
+    ok = False
+    for c in _clip_cmds(True):
+        try:
+            subprocess.run(c, input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1,
+                           start_new_session=True)
+            ok = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if not ok:  # no clipboard tool: ask the terminal (OSC 52)
+        import base64
+        os.write(sys.stdout.fileno(), b'\x1b]52;c;' + base64.b64encode(data) + b'\x07')
+
+
+def clip_get():
+    for c in _clip_cmds(False):
+        try:
+            r = subprocess.run(c, capture_output=True, timeout=0.5)
+            if r.returncode == 0:
+                return r.stdout.decode('utf-8', 'surrogateescape')
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+FM_MOUSE = curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED
+EDIT_MOUSE = FM_MOUSE | curses.BUTTON1_RELEASED | curses.REPORT_MOUSE_POSITION
+
+
+def is_word(c):
+    return c.isalnum() or c == '_'
+
+
+def read_key(scr):
+    try:
+        return scr.get_wch()
+    except curses.error:
+        return None
+
+
+def ask(scr, prompt, redraw, initial='', on_change=None, mask=False):
+    """Line input on the bottom row; returns the text or None on Esc."""
+    buf = list(initial)
+    pos = len(buf)
+    curses.curs_set(1)
+    try:
+        while True:
+            redraw()
+            h, w = scr.getmaxyx()
+            y = h - 1
+            fill(scr, y, col(WHITE, DARK))
+            put(scr, y, 0, f' {prompt} ', col(BLACK, YELLOW) | curses.A_BOLD)
+            x0 = swidth(prompt) + 3
+            txt = ''.join(buf)
+            off = max(0, swidth(txt[:pos]) - (w - x0 - 2))
+            if mask:
+                txt = '•' * len(txt)
+            put(scr, y, x0, txt[off:], col(WHITE, DARK) | curses.A_BOLD)
+            scr.move(y, min(w - 1, x0 + swidth(txt[off:pos])))
+            k = read_key(scr)
+            if k in ('\n', '\r', curses.KEY_ENTER):
+                return ''.join(buf)
+            if k == '\x1b' or k == '\x03' or k == '\x11':
+                return None
+            if k in (curses.KEY_BACKSPACE, '\x7f', '\x08'):
+                if pos:
+                    pos -= 1
+                    del buf[pos]
+            elif k == curses.KEY_DC:
+                if pos < len(buf):
+                    del buf[pos]
+            elif k == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif k == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif k == curses.KEY_HOME:
+                pos = 0
+            elif k == curses.KEY_END:
+                pos = len(buf)
+            elif isinstance(k, str) and k.isprintable():
+                buf.insert(pos, k)
+                pos += 1
+            else:
+                continue
+            if on_change:
+                on_change(''.join(buf))
+    finally:
+        curses.curs_set(0)
+
+
+def popup(scr, title, lines, color=RED, keys='qualquer tecla para voltar'):
+    """Centered message box; returns the key pressed."""
+    while True:
+        h, w = scr.getmaxyx()
+        bw = min(w - 4, max(swidth(title) + 6, max(swidth(t) for t in lines) + 6, swidth(keys) + 6))
+        bh = len(lines) + 4
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        box = col(WHITE, SEL)
+        for i in range(bh):
+            put(scr, y0 + i, x0, ' ' * bw, box)
+        hdr = col(BLACK if color in LIGHT_BG else WHITE, color) | curses.A_BOLD
+        put(scr, y0, x0, ' ' * bw, hdr)
+        put(scr, y0, x0 + 2, clip(title, bw - 4), hdr)
+        for i, l in enumerate(lines):
+            put(scr, y0 + 2 + i, x0 + 3, clip(l, bw - 6), box)
+        put(scr, y0 + bh - 1, x0 + 3, clip(keys, bw - 6), col(GRAY, SEL))
+        scr.refresh()
+        k = read_key(scr)
+        if k == curses.KEY_RESIZE:
+            continue
+        if k is not None:
+            return k
+
+
+def confirm(scr, title, lines, color=RED):
+    k = popup(scr, title, lines, color, 's = sim   ·   qualquer outra tecla = não')
+    return k in ('s', 'S', 'y', 'Y')
+
+
+TAB = 4
+
+
+class Editor:
+    MAX = 20 * 1024 * 1024
+
+    def __init__(self, app, path):
+        self.app, self.scr, self.path = app, app.scr, path
+        with open(path, 'rb') as f:
+            data = f.read()
+        text = data.decode('utf-8', 'surrogateescape')
+        self.crlf = '\r\n' in text
+        if self.crlf:
+            text = text.replace('\r\n', '\n')
+        self.lines = text.split('\n')
+        self.use_tabs = any(ln.startswith('\t') for ln in self.lines[:500])
+        self.cy = self.cx = self.top = self.left = self.want = 0
+        self.dirty = False
+        self.undo, self.redo, self.last_kind = [], [], None
+        self.clip = None  # (text, linewise)
+        self.anchor = None  # (line, col); the cursor is the other end
+        self.dragging = False
+        self.last_click = (0, None)
+        self.search = ''
+        self.msg, self.msg_color = '', GREEN
+        self.text_rows, self.gutter = 1, 4
+
+    def rx(self, line, cx):
+        return len(line[:cx].expandtabs(TAB))
+
+    def cx_from_rx(self, line, rx):
+        cur = 0
+        for i, c in enumerate(line):
+            cur += TAB - cur % TAB if c == '\t' else 1
+            if cur > rx:
+                return i
+        return len(line)
+
+    def snap(self, kind):
+        if kind != self.last_kind or kind not in ('type', 'del'):
+            self.undo.append((list(self.lines), self.cy, self.cx))
+            if len(self.undo) > 300:
+                self.undo.pop(0)
+            self.redo.clear()
+        self.last_kind = kind
+        self.dirty = True
+
+    def say(self, msg, color=GREEN):
+        self.msg, self.msg_color = msg, color
+
+    def pending_input(self):
+        """True if more input is buffered, e.g. a paste."""
+        self.scr.nodelay(True)
+        k = read_key(self.scr)
+        self.scr.nodelay(False)
+        if k is None:
+            return False
+        curses.unget_wch(k) if isinstance(k, str) else curses.ungetch(k)
+        return True
+
+    def sel_range(self):
+        if self.anchor is None or self.anchor == (self.cy, self.cx):
+            return None
+        a, b = self.anchor, (self.cy, self.cx)
+        return (a, b) if a < b else (b, a)
+
+    def sel_text(self, r):
+        (l1, c1), (l2, c2) = r
+        if l1 == l2:
+            return self.lines[l1][c1:c2]
+        return '\n'.join([self.lines[l1][c1:]] + self.lines[l1 + 1:l2] + [self.lines[l2][:c2]])
+
+    def del_sel(self, r):
+        (l1, c1), (l2, c2) = r
+        self.lines[l1:l2 + 1] = [self.lines[l1][:c1] + self.lines[l2][c2:]]
+        self.cy, self.cx, self.anchor = l1, c1, None
+
+    def copy(self, text, linewise=False):
+        self.clip = (text, linewise)
+        clip_set(text + ('\n' if linewise else ''))
+
+    def copy_sel(self):
+        r = self.sel_range()
+        if r:
+            t = self.sel_text(r)
+            self.copy(t)
+            self.say(f'{len(t)} caracteres selecionados (copiado)', CYAN)
+
+    def insert_text(self, s):
+        parts = s.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+        line = self.lines[self.cy]
+        before, after = line[:self.cx], line[self.cx:]
+        if len(parts) == 1:
+            self.lines[self.cy] = before + parts[0] + after
+            self.cx += len(parts[0])
+        else:
+            self.lines[self.cy:self.cy + 1] = [before + parts[0]] + parts[1:-1] + [parts[-1] + after]
+            self.cy += len(parts) - 1
+            self.cx = len(parts[-1])
+
+    def paste(self):
+        sysclip = clip_get()
+        if self.clip and (sysclip is None or sysclip == self.clip[0] + ('\n' if self.clip[1] else '')):
+            text, linewise = self.clip
+        elif sysclip:
+            text, linewise = sysclip, False  # copied from another program
+        else:
+            self.say('Área de transferência vazia', ORANGE)
+            return
+        self.snap('paste')
+        r = self.sel_range()
+        if r:
+            self.del_sel(r)
+        self.anchor = None
+        if linewise:
+            self.lines.insert(self.cy, text)
+            self.cy += 1
+        else:
+            self.insert_text(text)
+        self.want = self.rx(self.lines[self.cy], self.cx)
+
+    def mouse_pos(self, mx, my):
+        n = len(self.lines)
+        if my < 1:  # dragging past the edge scrolls
+            ln = max(0, self.top - 1)
+        elif my > self.text_rows:
+            ln = min(n - 1, self.top + self.text_rows)
+        else:
+            ln = min(n - 1, self.top + my - 1)
+        return ln, self.cx_from_rx(self.lines[ln], self.left + max(0, mx - self.gutter))
+
+    def mouse(self):
+        try:
+            _, mx, my, _, b = curses.getmouse()
+        except curses.error:
+            return
+        if b & curses.REPORT_MOUSE_POSITION:
+            if self.dragging:
+                self.cy, self.cx = self.mouse_pos(mx, my)
+        elif b & curses.BUTTON4_PRESSED:
+            self.cy = max(0, self.cy - 3)
+            self.cx = self.cx_from_rx(self.lines[self.cy], self.want)
+        elif b & curses.BUTTON5_PRESSED:
+            self.cy = min(len(self.lines) - 1, self.cy + 3)
+            self.cx = self.cx_from_rx(self.lines[self.cy], self.want)
+        elif b & curses.BUTTON1_PRESSED:
+            pos = self.mouse_pos(mx, my)
+            now = time.monotonic()
+            if self.last_click[1] == pos and now - self.last_click[0] < 0.4:  # double click: word
+                line, a = self.lines[pos[0]], pos[1]
+                while a > 0 and is_word(line[a - 1]):
+                    a -= 1
+                z = pos[1]
+                while z < len(line) and is_word(line[z]):
+                    z += 1
+                self.anchor, (self.cy, self.cx) = (pos[0], a), (pos[0], z)
+                self.last_click, self.dragging = (0, None), False
+                self.copy_sel()
+                return
+            self.last_click = (now, pos)
+            self.cy, self.cx = pos
+            self.anchor, self.dragging = pos, True
+        elif b & curses.BUTTON1_RELEASED:
+            if self.dragging:
+                self.cy, self.cx = self.mouse_pos(mx, my)
+                self.dragging = False
+            if self.sel_range():
+                self.copy_sel()
+            else:
+                self.anchor = None
+        self.want = self.rx(self.lines[self.cy], self.cx)
+
+    KEYS = [('Ctrl+S', 'Salvar'), ('Ctrl+Q/Esc', 'Sair'), ('Ctrl+F', 'Buscar'), ('F3', 'Próx. resultado'),
+            ('Ctrl+G', 'Ir p/ linha'), ('Ctrl+Z', 'Desfazer'), ('Ctrl+Y', 'Refazer'),
+            ('Mouse/Shift+Setas', 'Selecionar (já copia)'), ('Ctrl+A', 'Selecionar tudo'),
+            ('Ctrl+C', 'Copiar'), ('Ctrl+X', 'Recortar'), ('Ctrl+V', 'Colar'),
+            ('', 'sem seleção, Ctrl+C/X usam a linha inteira'),
+            ('Ctrl+D', 'Duplicar linha'), ('Tab/Shift+Tab', 'Indentar'), ('PgUp/PgDn', 'Página'),
+            ('Home/End', 'Início/fim da linha')]
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        kh = len(wrap_keys(self.KEYS, w))
+        self.text_rows = rows = max(1, h - kh - 2)
+        x = label(scr, 0, 0, f'{IC["edit"]} EDITOR', RED, ORANGE)
+        name = safe(os.path.basename(self.path)) + (' *' if self.dirty else '')
+        x = label(scr, 0, x, name, ORANGE)
+        pos = f'Ln {self.cy + 1}/{len(self.lines)}  Col {self.cx + 1} '
+        put(scr, 0, x + 1, clip(safe(os.path.dirname(self.path)), max(0, w - x - len(pos) - 3)), col(GRAY))
+        put(scr, 0, w - len(pos), pos, col(WHITE) | curses.A_BOLD)
+        self.gutter = g = len(str(len(self.lines))) + 2
+        tw = max(1, w - g)
+        if self.cy < self.top:
+            self.top = self.cy
+        if self.cy >= self.top + rows:
+            self.top = self.cy - rows + 1
+        crx = self.rx(self.lines[self.cy], self.cx)
+        if crx < self.left:
+            self.left = crx
+        if crx >= self.left + tw:
+            self.left = crx - tw + 1
+        term = self.search.lower()
+        sel = self.sel_range()
+        for i in range(rows):
+            ln, y = self.top + i, 1 + i
+            if ln >= len(self.lines):
+                put(scr, y, 0, '~'.rjust(g - 1), col(DARK))
+                continue
+            cur = ln == self.cy
+            if cur:
+                fill(scr, y, col(None, (235, 0)))
+            put(scr, y, 0, str(ln + 1).rjust(g - 1), col(RED if cur else GRAY, (235, 0) if cur else None)
+                | (curses.A_BOLD if cur else 0))
+            full = safe(self.lines[ln].expandtabs(TAB))
+            s = full[self.left:self.left + tw]
+            put(scr, y, g, s, col(WHITE, (235, 0) if cur else None))
+            if term:
+                low, start = full.lower(), 0
+                while (j := low.find(term, start)) >= 0:
+                    a, b = max(j, self.left), min(j + len(term), self.left + tw)
+                    if a < b:
+                        put(scr, y, g + a - self.left, full[a:b], col(BLACK, YELLOW))
+                    start = j + max(1, len(term))
+            if sel and sel[0][0] <= ln <= sel[1][0]:
+                raw = self.lines[ln]
+                c1 = sel[0][1] if ln == sel[0][0] else 0
+                c2 = sel[1][1] if ln == sel[1][0] else len(raw)
+                a = self.rx(raw, c1)
+                b = self.rx(raw, c2) + (ln != sel[1][0])  # show the line break
+                a2, b2 = max(a, self.left), min(b, self.left + tw)
+                if a2 < b2:
+                    put(scr, y, g + a2 - self.left, full.ljust(b2)[a2:b2], col(WHITE, SELTXT))
+        sy = h - kh - 1
+        fill(scr, sy, col(None, DARK))
+        indent = 'Tabs' if self.use_tabs else f'{TAB} espaços'
+        info = f' UTF-8 · {"CRLF" if self.crlf else "LF"} · {indent} '
+        put(scr, sy, max(0, w - len(info)), info, col(GRAY, DARK))
+        if self.msg:
+            put(scr, sy, 1, clip(self.msg, w - len(info) - 2), col(self.msg_color, DARK) | curses.A_BOLD)
+        draw_keys(scr, self.KEYS)
+        scr.move(1 + self.cy - self.top, min(w - 1, g + crx - self.left))
+        scr.refresh()
+
+    def save(self):
+        data = '\n'.join(self.lines)
+        if self.crlf:
+            data = data.replace('\n', '\r\n')
+        try:
+            with open(self.path, 'wb') as f:
+                f.write(data.encode('utf-8', 'surrogateescape'))
+        except OSError as e:
+            self.say(f'Erro ao salvar: {e.strerror}', RED)
+            return False
+        self.dirty = False
+        self.say(f'Salvo! {len(self.lines)} linhas gravadas.')
+        return True
+
+    def find(self, new=True):
+        if new:
+            t = ask(self.scr, 'Buscar:', self.draw, self.search)
+            if t is None:
+                return
+            self.search = t
+        if not self.search:
+            return
+        term, n = self.search.lower(), len(self.lines)
+        # rest of the current line, then the following lines, wrapping around
+        for i in range(n + 1):
+            ln = (self.cy + i) % n
+            j = self.lines[ln].lower().find(term, self.cx + 1 if i == 0 else 0)
+            if j >= 0:
+                wrapped = i > 0 and ln <= self.cy
+                self.cy, self.cx = ln, j
+                self.want = self.rx(self.lines[ln], j)
+                self.say(f'Encontrado na linha {ln + 1}' + (' (do início do arquivo)' if wrapped else ''))
+                return
+        self.say(f'"{self.search}" não encontrado', ORANGE)
+
+    def goto(self):
+        t = ask(self.scr, 'Ir para a linha:', self.draw)
+        if t and t.strip().isdigit():
+            self.cy = max(0, min(len(self.lines) - 1, int(t) - 1))
+            self.cx = self.want = 0
+
+    def quit(self):
+        if not self.dirty:
+            return True
+        k = popup(self.scr, f'{IC["warn"]}  Alterações não salvas', [os.path.basename(self.path),
+                  '', 's  salvar e sair', 'n  sair sem salvar'], ORANGE, 'Esc = continuar editando')
+        if k in ('s', 'S'):
+            return self.save()
+        return k in ('n', 'N')
+
+    def indent_str(self):
+        return '\t' if self.use_tabs else ' ' * TAB
+
+    SHIFT_MOVES = {curses.KEY_SLEFT: curses.KEY_LEFT, curses.KEY_SRIGHT: curses.KEY_RIGHT,
+                   curses.KEY_SR: curses.KEY_UP, curses.KEY_SF: curses.KEY_DOWN,
+                   curses.KEY_SHOME: curses.KEY_HOME, curses.KEY_SEND: curses.KEY_END,
+                   curses.KEY_SPREVIOUS: curses.KEY_PPAGE, curses.KEY_SNEXT: curses.KEY_NPAGE}
+    BACKSPACE = (curses.KEY_BACKSPACE, '\x7f', '\x08')
+
+    def key(self, k, keep_sel=False):
+        if k in self.SHIFT_MOVES:
+            if self.anchor is None:
+                self.anchor = (self.cy, self.cx)
+            self.key(self.SHIFT_MOVES[k], keep_sel=True)
+            self.copy_sel()
+            return
+        if k == '\x01':  # Ctrl+A
+            self.anchor = (0, 0)
+            self.cy, self.cx = len(self.lines) - 1, len(self.lines[-1])
+            self.copy_sel()
+            return
+        if k == curses.KEY_MOUSE:
+            return self.mouse()
+        if k in ('\x16', '\x15'):  # Ctrl+V / Ctrl+U
+            return self.paste()
+        r = self.sel_range()
+        if r:
+            if k == '\x03':
+                return self.copy_sel()
+            if k in ('\x18', '\x0b'):
+                self.snap('cut')
+                t = self.sel_text(r)
+                self.copy(t)
+                self.del_sel(r)
+                self.say(f'{len(t)} caracteres recortados', CYAN)
+                return
+            if k in self.BACKSPACE or k == curses.KEY_DC:
+                self.snap('del')
+                return self.del_sel(r)
+            if k in ('\t', curses.KEY_BTAB) and r[0][0] != r[1][0]:
+                return self.indent_block(r, k == '\t')
+            if k in ('\n', '\r', curses.KEY_ENTER) or (isinstance(k, str) and k.isprintable()):
+                self.snap('type')  # typing replaces the selection
+                self.del_sel(r)
+        if not keep_sel and k != '\x13':
+            self.anchor = None
+        L = self.lines
+        line = L[self.cy]
+        vertical = False
+        if k == curses.KEY_UP:
+            self.cy = max(0, self.cy - 1)
+            vertical = True
+        elif k == curses.KEY_DOWN:
+            self.cy = min(len(L) - 1, self.cy + 1)
+            vertical = True
+        elif k == curses.KEY_PPAGE:
+            self.cy = max(0, self.cy - self.text_rows)
+            vertical = True
+        elif k == curses.KEY_NPAGE:
+            self.cy = min(len(L) - 1, self.cy + self.text_rows)
+            vertical = True
+        elif k == curses.KEY_LEFT:
+            if self.cx:
+                self.cx -= 1
+            elif self.cy:
+                self.cy -= 1
+                self.cx = len(L[self.cy])
+        elif k == curses.KEY_RIGHT:
+            if self.cx < len(line):
+                self.cx += 1
+            elif self.cy < len(L) - 1:
+                self.cy += 1
+                self.cx = 0
+        elif k == curses.KEY_HOME:
+            ind = len(line) - len(line.lstrip())
+            self.cx = ind if self.cx != ind else 0  # first press stops at the indentation
+        elif k == curses.KEY_END:
+            self.cx = len(line)
+        elif k in ('\n', '\r', curses.KEY_ENTER):
+            self.snap('enter')
+            ind = '' if self.pending_input() else line[:len(line) - len(line.lstrip(' \t'))]
+            ind = ind[:self.cx]
+            L[self.cy:self.cy + 1] = [line[:self.cx], ind + line[self.cx:]]
+            self.cy += 1
+            self.cx = len(ind)
+        elif k in (curses.KEY_BACKSPACE, '\x7f', '\x08'):
+            if self.cx:
+                self.snap('del')
+                n = 1
+                if line[:self.cx].endswith(' ' * TAB) and not line[:self.cx].strip():
+                    n = TAB - (self.cx - TAB) % TAB if self.cx % TAB else TAB
+                L[self.cy] = line[:self.cx - n] + line[self.cx:]
+                self.cx -= n
+            elif self.cy:
+                self.snap('del')
+                self.cx = len(L[self.cy - 1])
+                L[self.cy - 1] += line
+                del L[self.cy]
+                self.cy -= 1
+        elif k == curses.KEY_DC:
+            if self.cx < len(line):
+                self.snap('del')
+                L[self.cy] = line[:self.cx] + line[self.cx + 1:]
+            elif self.cy < len(L) - 1:
+                self.snap('del')
+                L[self.cy] = line + L[self.cy + 1]
+                del L[self.cy + 1]
+        elif k == '\t':
+            self.snap('indent')
+            s = self.indent_str()
+            if not self.use_tabs and self.cx % TAB:
+                s = ' ' * (TAB - self.cx % TAB)
+            L[self.cy] = line[:self.cx] + s + line[self.cx:]
+            self.cx += len(s)
+        elif k == curses.KEY_BTAB:
+            s = self.indent_str()
+            n = min(len(line) - len(line.lstrip(' ')), len(s)) if not line.startswith(s) else len(s)
+            if n:
+                self.snap('indent')
+                L[self.cy] = line[n:]
+                self.cx = max(0, self.cx - n)
+        elif k == '\x13':  # Ctrl+S
+            self.save()
+        elif k == '\x06':  # Ctrl+F
+            self.find(True)
+        elif k == curses.KEY_F3 or k == '\x0e':
+            self.find(False)
+        elif k == '\x07':  # Ctrl+G
+            self.goto()
+        elif k == '\x1a':  # Ctrl+Z
+            if self.undo:
+                self.redo.append((list(L), self.cy, self.cx))
+                self.lines, self.cy, self.cx = self.undo.pop()
+                self.dirty, self.last_kind = True, None
+                self.say('Desfeito')
+            else:
+                self.say('Nada para desfazer', ORANGE)
+        elif k == '\x19':  # Ctrl+Y
+            if self.redo:
+                self.undo.append((list(L), self.cy, self.cx))
+                self.lines, self.cy, self.cx = self.redo.pop()
+                self.dirty, self.last_kind = True, None
+                self.say('Refeito')
+        elif k == '\x03':  # Ctrl+C on the whole line
+            self.copy(line, linewise=True)
+            self.say('Linha copiada')
+        elif k in ('\x18', '\x0b'):  # Ctrl+X / Ctrl+K
+            self.snap('cut')
+            self.copy(line, linewise=True)
+            if len(L) > 1:
+                del L[self.cy]
+                self.cy = min(self.cy, len(L) - 1)
+            else:
+                L[0] = ''
+            self.cx = min(self.cx, len(L[self.cy]))
+            self.say('Linha recortada')
+        elif k == '\x04':  # Ctrl+D
+            self.snap('dup')
+            L.insert(self.cy + 1, line)
+            self.cy += 1
+        elif isinstance(k, str) and (k.isprintable() or k == '\t'):
+            self.snap('type')
+            L[self.cy] = line[:self.cx] + k + line[self.cx:]
+            self.cx += 1
+        else:
+            return
+        if vertical:
+            self.cx = self.cx_from_rx(self.lines[self.cy], self.want)
+        else:
+            self.want = self.rx(self.lines[self.cy], self.cx)
+        self.cx = min(self.cx, len(self.lines[self.cy]))
+
+    def indent_block(self, r, add):
+        (l1, _), (l2, c2) = r
+        if c2 == 0:
+            l2 -= 1  # selection ends at column 0: skip that line
+        self.snap('indent')
+        s = self.indent_str()
+        for i in range(l1, l2 + 1):
+            ln = self.lines[i]
+            if add:
+                self.lines[i] = s + ln if ln else ln
+            else:
+                n = len(ln) - len(ln.lstrip(' \t'))
+                self.lines[i] = ln[min(n, len(s) if ln.startswith(s) else 1):] if n else ln
+        self.anchor = (l1, 0)
+        self.cy, self.cx = l2, len(self.lines[l2])
+
+    def run(self):
+        curses.curs_set(1)
+        curses.mousemask(EDIT_MOUSE)
+        drag = False
+        try:
+            while True:
+                self.draw()
+                if not drag:  # ncurses only reports clicks; also ask for drag events
+                    os.write(sys.stdout.fileno(), b'\x1b[?1002h')
+                    drag = True
+                k = read_key(self.scr)
+                if k is None or k == curses.KEY_RESIZE:
+                    continue
+                if k not in ('\x13', '\x03', '\x01', curses.KEY_MOUSE) and k not in self.SHIFT_MOVES:
+                    self.msg = ''
+                if k == '\x1b' and self.anchor is not None:
+                    self.anchor = None
+                    continue
+                if k in ('\x11', '\x1b'):
+                    if self.quit():
+                        return
+                    continue
+                self.key(k)
+        finally:
+            os.write(sys.stdout.fileno(), b'\x1b[?1002l')
+            curses.mousemask(FM_MOUSE)
+            curses.curs_set(0)
+
+
+CONF_DIR = os.path.join(os.environ.get('XDG_CONFIG_HOME', os.path.expanduser('~/.config')), 'canivt')
+
+
+def conf_load(name, default):
+    try:
+        with open(os.path.join(CONF_DIR, name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def conf_save(name, data, private=False):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    path = os.path.join(CONF_DIR, name)
+    tmp = path + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def default_favorites():
+    home = os.path.expanduser('~')
+    dirs = {}
+    try:  # xdg-user-dirs (localized folder names)
+        with open(os.path.expanduser('~/.config/user-dirs.dirs')) as f:
+            for line in f:
+                k, _, v = line.strip().partition('=')
+                if k.startswith('XDG_') and v:
+                    dirs[k[4:-4]] = v.strip('"').replace('$HOME', home)
+    except OSError:
+        pass
+    return [dirs.get(k) or os.path.join(home, fb) for k, fb in
+            (('DESKTOP', 'Área de trabalho'), ('DOCUMENTS', 'Documentos'), ('DOWNLOAD', 'Downloads'))]
+
+
+GVFS = f'/run/user/{os.getuid()}/gvfs'
+
+
+def gvfs_helper(name):
+    """Path of a gvfs daemon binary; the directory differs between distros."""
+    for d in ('/usr/libexec', '/usr/lib/gvfs', '/usr/lib', '/usr/libexec/gvfs'):
+        if os.path.exists(os.path.join(d, name)):
+            return os.path.join(d, name)
+    return None
+
+
+def smb_split(url):
+    """'smb://host/share/a/b' -> ('host', 'share', 'a/b')"""
+    host, _, rest = url[len('smb://'):].strip('/').partition('/')
+    share, _, sub = rest.partition('/')
+    return host.rpartition('@')[2].lower(), share, sub
+
+
+def smb_mountdir(path):
+    """(mount_root, host, share) if path is inside a gvfs SMB mount."""
+    if not path.startswith(GVFS + '/smb-share:'):
+        return None
+    name = path[len(GVFS) + 1:].split('/')[0]
+    params = dict(kv.split('=', 1) for kv in name[len('smb-share:'):].split(',') if '=' in kv)
+    return os.path.join(GVFS, name), unquote(params.get('server', '')), unquote(params.get('share', ''))
+
+
+def smb_url(path):
+    m = smb_mountdir(path)
+    if not m:
+        return None
+    sub = os.path.relpath(path, m[0])
+    return f'smb://{m[1]}/{m[2]}' + ('' if sub == '.' else '/' + sub)
+
+
+def smb_find_mount(host, share):
+    try:
+        names = os.listdir(GVFS)
+    except OSError:
+        return None
+    for n in names:
+        m = smb_mountdir(os.path.join(GVFS, n))
+        if m and m[1].lower() == host.lower() and m[2].lower() == share.lower():
+            return m[0]
+    return None
+
+
+def smb_base(srv):
+    if not srv.get('user'):
+        return f'smb://{srv["host"]}/'
+    dom = quote(srv.get('domain') or 'WORKGROUP', safe='')
+    return f'smb://{dom};{quote(srv["user"], safe="")}@{srv["host"]}/'
+
+
+def gio_run(args, srv, timeout=30):
+    """Run gio, answering the password prompt. Returns (ok, stdout, error)."""
+    if not srv.get('user') and args[0] == 'mount':
+        args = ['mount', '-a'] + args[1:]  # guest
+    try:
+        r = subprocess.run(['gio'] + args, input=srv.get('password', '') + '\n', capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, '', 'o servidor não respondeu (tempo esgotado)'
+    except OSError as e:
+        return False, '', str(e)
+    err = [ln for ln in r.stderr.splitlines() if ln.strip() and 'Password' not in ln and 'Senha' not in ln]
+    return r.returncode == 0, r.stdout, (err[-1] if err else 'falha desconhecida')
+
+
+def srv_label(s):
+    return s['host'] + (f'/{s["share"]}' if s.get('share') else '')
+
+
+def pick(scr, title, items, color=CYAN):
+    """Pick one item from a list; returns its index or None."""
+    sel = top = 0
+    while True:
+        h, w = scr.getmaxyx()
+        rows = max(1, min(len(items), h - 8))
+        top = min(max(top, sel - rows + 1), sel)
+        bw = min(w - 4, max(swidth(title) + 6, max(swidth(i) for i in items) + 10, 36))
+        bh = rows + 4
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        box = col(WHITE, SEL)
+        for i in range(bh):
+            put(scr, y0 + i, x0, ' ' * bw, box)
+        hdr = col(BLACK if color in LIGHT_BG else WHITE, color) | curses.A_BOLD
+        put(scr, y0, x0, ' ' * bw, hdr)
+        put(scr, y0, x0 + 2, clip(title, bw - 4), hdr)
+        for i in range(rows):
+            j = top + i
+            if j >= len(items):
+                break
+            on = j == sel
+            num = f'{j + 1}' if j < 9 else ' '
+            put(scr, y0 + 2 + i, x0 + 2, ' ' * (bw - 4), col(WHITE, BLUE if on else SEL))
+            put(scr, y0 + 2 + i, x0 + 3, clip(f'{num}  {items[j]}', bw - 6),
+                col(WHITE, BLUE if on else SEL) | (curses.A_BOLD if on else 0))
+        hint = '↑↓ escolher · Enter confirmar · Esc cancelar'
+        put(scr, y0 + bh - 1, x0 + 3, clip(hint, bw - 6), col(GRAY, SEL))
+        scr.refresh()
+        k = read_key(scr)
+        if k == curses.KEY_UP:
+            sel = (sel - 1) % len(items)
+        elif k == curses.KEY_DOWN:
+            sel = (sel + 1) % len(items)
+        elif k in ('\n', '\r', curses.KEY_ENTER, curses.KEY_RIGHT):
+            return sel
+        elif isinstance(k, str) and k.isdigit() and 0 < int(k) <= min(9, len(items)):
+            return int(k) - 1
+        elif k in ('\x1b', 'q', curses.KEY_LEFT):
+            return None
+
+
+class Entry:
+    __slots__ = ('name', 'path', 'is_dir', 'is_link', 'size', 'mtime', 'mode', 'kind', 'disp')
+
+    def __init__(self, de):
+        self.name, self.path = de.name, de.path
+        self.is_link = de.is_symlink()
+        try:
+            st = de.stat()
+            self.is_dir = stat.S_ISDIR(st.st_mode)
+            self.size, self.mtime, self.mode = st.st_size, st.st_mtime, st.st_mode
+        except OSError:  # broken symlink
+            self.is_dir, self.size, self.mtime, self.mode = False, 0, 0, 0
+        self.kind = kind_of(self.name, self.is_dir, self.mode)
+        self.disp = safe(self.name)
+
+
+class App:
+    SIDE_W = 24
+
+    def __init__(self, scr, start):
+        self.scr = scr
+        self.cwd = start
+        self.hidden = False
+        self.filter = ''
+        self.sel = self.top = 0
+        self.remember = {}
+        self.entries = []
+        self.msg, self.msg_color = '', GREEN
+        self.clipboard = None  # (mode, path)
+        self.crumbs = []
+        self.list_y, self.list_rows, self.lx = 2, 1, 0
+        self.last_click = (0, -1)
+        self.favs = conf_load('favoritos.json', None)
+        if self.favs is None:
+            self.favs = default_favorites()
+        self.servers = conf_load('servidores.json', [])
+        self.show_side = True
+        self.side_rows = {}  # screen row -> target
+        self.load()
+
+    def load(self, focus=None):
+        try:
+            with os.scandir(self.cwd) as it:
+                ents = [Entry(d) for d in it if self.hidden or not d.name.startswith('.')]
+        except OSError as e:
+            self.say(f'Sem acesso: {e.strerror}', RED)
+            ents = []
+        ents.sort(key=lambda e: (not e.is_dir, e.name.lower()))
+        self.all = ents
+        self.apply_filter(focus)
+
+    def apply_filter(self, focus=None):
+        f = self.filter.lower()
+        ents = [e for e in self.all if f in e.name.lower()] if f else list(self.all)
+        self.entries = ([None] if self.cwd != '/' else []) + ents  # None is the ".." row
+        focus = focus or self.remember.get(self.cwd)
+        self.sel = 0
+        if focus:
+            for i, e in enumerate(self.entries):
+                if e and e.name == focus:
+                    self.sel = i
+                    break
+        if self.sel == 0 and self.entries and self.entries[0] is None and len(self.entries) > 1 and not focus:
+            self.sel = 1
+        self.sel = min(self.sel, max(0, len(self.entries) - 1))
+
+    def say(self, msg, color=GREEN):
+        self.msg, self.msg_color = msg, color
+
+    @property
+    def cur(self):
+        return self.entries[self.sel] if self.entries else None
+
+    def go(self, path, focus=None):
+        if path.startswith('smb://'):
+            return self.open_url(path)
+        path = os.path.abspath(path)
+        if not os.path.isdir(path):
+            self.say(f'Pasta não existe: {path}', RED)
+            return
+        if not os.access(path, os.R_OK | os.X_OK):
+            self.say(f'Sem permissão para abrir {path}', RED)
+            return
+        if self.cur:
+            self.remember[self.cwd] = self.cur.name
+        self.cwd, self.filter, self.top = path, '', 0
+        try:
+            os.chdir(path)
+        except OSError:
+            pass
+        self.load(focus)
+
+    def up(self):
+        m = smb_mountdir(self.cwd)
+        if m and self.cwd == m[0]:  # leaving a share shows the share list
+            return self.open_url(f'smb://{m[1]}')
+        if self.cwd != '/':
+            self.go(os.path.dirname(self.cwd), os.path.basename(self.cwd))
+
+    def fav_key(self, path):
+        return smb_url(path) or path
+
+    def toggle_fav(self):
+        e = self.cur
+        target = e.path if e is not None and e.is_dir else self.cwd
+        key = self.fav_key(target)
+        name = safe(os.path.basename(key.rstrip('/')) or key)
+        if key in self.favs:
+            self.favs.remove(key)
+            self.say(f'{name} removido dos favoritos', ORANGE)
+        else:
+            self.favs.append(key)
+            self.say(f'{name} adicionado aos favoritos', CYAN)
+        conf_save('favoritos.json', self.favs)
+
+    def save_server(self, srv):
+        key = (srv['host'], srv.get('user'), srv.get('share', ''))
+        self.servers = [s for s in self.servers if (s['host'], s.get('user'), s.get('share', '')) != key]
+        self.servers.append(srv)
+        conf_save('servidores.json', self.servers, private=True)
+
+    def need_gvfs(self):
+        fuse = gvfs_helper('gvfsd-fuse')
+        if gvfs_helper('gvfsd-smb') and fuse:
+            if not os.path.ismount(GVFS):  # installed after the session started
+                os.makedirs(GVFS, exist_ok=True)
+                subprocess.run([fuse, GVFS], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            return False
+        popup(self.scr, f'{IC["warn"]}  Suporte a SMB não instalado', [
+            'O canivt usa o gvfs para acessar servidores Samba.',
+            'Instale os pacotes gvfs-backends e gvfs-fuse',
+            '(ou rode o instalador do canivt de novo).', '',
+            'Depois saia da sessão e entre de novo.'], ORANGE)
+        return True
+
+    def busy(self, msg):
+        self.say(msg, YELLOW)
+        self.draw()
+
+    def smb_open(self, srv, share=None, sub=''):
+        """Mount the share if needed and enter it."""
+        if self.need_gvfs():
+            return False
+        share = share or srv.get('share')
+        if not share:
+            self.busy(f'Listando compartilhamentos de {srv["host"]}...')
+            gio_run(['mount', smb_base(srv)], srv)
+            ok, out, err = gio_run(['list', smb_base(srv)], srv, 20)
+            names = (s.strip().rstrip('/') for s in out.splitlines())
+            shares = sorted(s for s in names if s and not s.endswith('$'))  # skip hidden/admin shares
+            if not ok or not shares:
+                self.msg = ''
+                why = err if not ok else 'nenhum encontrado'
+                share = ask(self.scr, f'Não consegui listar ({why}). Nome do compartilhamento:', self.draw)
+                if not share:
+                    return False
+            else:
+                self.msg = ''
+                i = pick(self.scr, f'{IC["net"]}  Compartilhamentos em {srv["host"]}', shares)
+                if i is None:
+                    return False
+                share = shares[i]
+        mnt = smb_find_mount(srv['host'], share)
+        if not mnt:
+            self.busy(f'Conectando a {srv["host"]}/{share}...')
+            ok, _, err = gio_run(['mount', smb_base(srv) + quote(share)], srv)
+            self.msg = ''
+            mnt = smb_find_mount(srv['host'], share)
+            if not mnt:
+                lines = [f'smb://{srv["host"]}/{share}', '']
+                if ok:
+                    lines += ['Montou, mas a pasta local não apareceu.',
+                              'Confira se o gvfs-fuse está instalado e reinicie a sessão.']
+                else:
+                    lines += [clip(err, 70), '', 'Confira IP, usuário, senha e nome do compartilhamento.']
+                popup(self.scr, f'{IC["warn"]}  Não foi possível conectar', lines)
+                return False
+        target = os.path.join(mnt, sub) if sub else mnt
+        self.go(target if os.path.isdir(target) else mnt)
+        self.say(f'Conectado a {srv["host"]}/{share}', GREEN)
+        return True
+
+    def open_url(self, url):
+        host, share, sub = smb_split(url)
+        if share:
+            mnt = smb_find_mount(host, share)
+            if mnt and os.path.isdir(os.path.join(mnt, sub)):
+                return self.go(os.path.join(mnt, sub))
+        cands = [s for s in self.servers if s['host'].lower() == host]
+        cands.sort(key=lambda s: s.get('share', '') != share)
+        if cands:
+            return self.smb_open(cands[0], share, sub)
+        return self.connect_form(host, share)
+
+    def connect_form(self, host='', share=''):
+        if self.need_gvfs():
+            return
+        host = ask(self.scr, 'Servidor SMB (IP ou nome):', self.draw, host)
+        if not host:
+            return
+        host = host.strip().removeprefix('smb://').strip('/').replace('\\', '/').lstrip('/')
+        if '/' in host:
+            host, share = host.split('/', 1)
+        user = ask(self.scr, 'Usuário (vazio = convidado):', self.draw)
+        if user is None:
+            return
+        pw = ''
+        if user:
+            pw = ask(self.scr, 'Senha:', self.draw, mask=True)
+            if pw is None:
+                return
+        share = ask(self.scr, 'Compartilhamento (vazio = mostrar todos):', self.draw, share)
+        if share is None:
+            return
+        srv = dict(host=host.lower(), user=user.strip(), password=pw, domain='WORKGROUP',
+                   share=share.strip('/'))
+        if self.smb_open(srv):
+            self.save_server(srv)
+            self.say(f'Conectado e memorizado: {srv_label(srv)} (atalho na barra lateral)', GREEN)
+
+    def forget_server(self):
+        if not self.servers:
+            self.say('Nenhum servidor memorizado', ORANGE)
+            return
+        names = [f'{srv_label(s)}  ({s.get("user") or "convidado"})' for s in self.servers]
+        i = pick(self.scr, 'Esquecer qual servidor?', names, RED)
+        if i is None:
+            return
+        s = self.servers.pop(i)
+        conf_save('servidores.json', self.servers, private=True)
+        self.say(f'{srv_label(s)} esquecido (usuário e senha apagados)', ORANGE)
+
+    def disconnect(self):
+        m = smb_mountdir(self.cwd)
+        if not m:
+            self.say('Você não está em um servidor', ORANGE)
+            return
+        self.go(os.path.expanduser('~'))
+        r = subprocess.run(['gio', 'mount', '-u', f'smb://{m[1]}/{m[2]}'], capture_output=True, text=True)
+        if r.returncode == 0:
+            self.say(f'Desconectado de {m[1]}/{m[2]}')
+        else:
+            self.say(f'Erro ao desconectar: {r.stderr.strip()}', RED)
+
+    def draw_crumbs(self):
+        scr = self.scr
+        h, w = scr.getmaxyx()
+        fill(scr, 0, col(None, None))
+        segs = [(f'{IC["root"]} /', '/')]
+        m = smb_mountdir(self.cwd)
+        if m:
+            segs += [(f'{IC["net"]} {safe(m[1])}', f'smb://{m[1]}'), (f'{IC["share"]} {safe(m[2])}', m[0])]
+            acc, rel = m[0], os.path.relpath(self.cwd, m[0])
+            parts = [] if rel == '.' else rel.split('/')
+        else:
+            acc, parts = '', [p for p in self.cwd.split('/') if p]
+        home = os.path.expanduser('~')
+        for p in parts:
+            acc += '/' + p
+            segs.append((f'{IC["home"] if acc == home else IC["dir"]} {safe(p)}', acc))
+        # collapse from the left when it does not fit
+        widths = [swidth(t) + 3 for t, _ in segs]
+        hidden = 0
+        while sum(widths) + (4 if hidden else 0) > w - 2 and len(segs) - hidden > 2:
+            hidden += 1
+            widths[hidden] = 0
+        shown = [segs[0]] + ([('…', segs[hidden][1])] if hidden else []) + segs[hidden + 1:]
+        colors = [RED] + [CRUMBS[(i + hidden) % len(CRUMBS)] for i in range(len(shown) - 1)]
+        self.crumbs = []
+        x = 0
+        for i, (t, p) in enumerate(shown):
+            x0 = x
+            last = i == len(shown) - 1
+            x = label(scr, 0, x, t, colors[i], None if last else colors[i + 1])
+            self.crumbs.append((x0, x, p))
+
+    def draw_side(self, y0, y1):
+        scr, sw = self.scr, self.SIDE_W
+        bg = (235, 0)
+        for y in range(y0, y1):
+            put(scr, y, 0, ' ' * (sw - 1), col(None, bg))
+            put(scr, y, sw - 1, '│', col(DARK))
+        here = self.fav_key(self.cwd)
+        self.side_rows = {}
+        y = y0
+
+        def head(text):
+            nonlocal y
+            if y < y1:
+                put(scr, y, 1, text, col(GRAY, bg) | curses.A_BOLD)
+            y += 1
+
+        def item(icon, name, action, active, num=None):
+            nonlocal y
+            key = str((num + 1) % 10) if num is not None and num < 10 else ''
+            if y < y1:
+                ib = (237, 0) if active else bg
+                put(scr, y, 0, ' ' * (sw - 1), col(None, ib))
+                if active:
+                    put(scr, y, 0, '▌', col(RED, ib))
+                put(scr, y, 1, f' {key} ' if key else '   ', col(BLACK, RED if key else ib) | curses.A_BOLD)
+                put(scr, y, 5, clip(f'{icon} {name}', sw - 7),
+                    col(RED if active else WHITE, ib) | (curses.A_BOLD if active else 0))
+                self.side_rows[y] = action
+            y += 1
+
+        head(f'{IC["star"]} FAVORITOS')
+        if not self.favs:
+            put(scr, y, 2, 'f marca a pasta', col(GRAY, bg))
+            y += 1
+        for i, f in enumerate(self.favs):
+            name = os.path.basename(f.rstrip('/')) or f
+            if f.startswith('smb://'):
+                icon = IC['net']
+            else:
+                icon = IC['home'] if f == os.path.expanduser('~') else IC['dir']
+            item(icon, safe(name), f, here == f, i)
+        y += 1
+        head(f'{IC["net"]} SERVIDORES')
+        m = smb_mountdir(self.cwd)
+        for i, s in enumerate(self.servers):
+            active = bool(m and m[1].lower() == s['host']
+                          and (not s.get('share') or s['share'].lower() == m[2].lower()))
+            item(IC['share'], safe(srv_label(s)), ('srv', s), active, len(self.favs) + i)
+        item('+', 'conectar (s)', ('connect',), False)
+
+    def side_targets(self):
+        """Targets of the number keys: favourites first, then servers."""
+        return (self.favs + [('srv', s) for s in self.servers])[:10]
+
+    def side_action(self, a):
+        if isinstance(a, str):
+            self.go(a)
+        elif a[0] == 'srv':
+            self.smb_open(a[1])
+        elif a[0] == 'connect':
+            self.connect_form()
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        self.draw_crumbs()
+        in_smb = smb_mountdir(self.cwd) is not None
+        keys = [('↑ ↓', 'Navegar'), ('→ Enter', 'Abrir'), ('←', 'Voltar'), ('1-9', 'Ir p/ favorito'),
+                ('f', 'Favoritar/desfavoritar'), ('s', 'Conectar servidor SMB')]
+        if in_smb:
+            keys.append(('u', 'Desconectar'))
+        keys += [('S', 'Esquecer servidor'), ('/', 'Filtrar'), ('.', 'Ocultos'), ('~', 'Home'),
+                 ('\\', 'Raiz'), ('g', 'Ir para'), ('n', 'Novo arquivo'), ('N', 'Nova pasta'),
+                 ('r', 'Renomear'), ('Del', 'Excluir'), ('c', 'Copiar'), ('x', 'Recortar'), ('v', 'Colar'),
+                 ('o', 'Abrir no sistema'), ('b', 'Barra lateral'), ('q', 'Sair')]
+        kh = len(wrap_keys(keys, w))
+        self.list_y = 2
+        self.list_rows = rows = max(1, h - kh - 3)
+        self.lx = lx = self.SIDE_W if self.show_side and w >= 70 else 0
+        if lx:
+            self.draw_side(1, h - kh - 1)
+        else:
+            self.side_rows = {}
+        if self.sel < self.top:
+            self.top = self.sel
+        if self.sel >= self.top + rows:
+            self.top = self.sel - rows + 1
+        self.top = max(0, min(self.top, max(0, len(self.entries) - rows)))
+        show_meta = w - lx >= 60
+        for i in range(rows):
+            j = self.top + i
+            if j >= len(self.entries):
+                break
+            e = self.entries[j]
+            y = self.list_y + i
+            selected = j == self.sel
+            bg = SEL if selected else None
+            if selected:
+                fill(scr, y, col(None, SEL), lx)
+                put(scr, y, lx, '▌', col(RED, SEL))
+            if e is None:
+                put(scr, y, lx + 2, f'{IC["up"]} ..', col(GRAY, bg) | curses.A_BOLD)
+                put(scr, y, lx + 8, 'voltar uma pasta', col(DARK if not selected else GRAY, bg))
+                continue
+            c = KIND_COLOR['link'] if e.is_link and not e.is_dir else KIND_COLOR[e.kind]
+            icon = IC[e.kind] if e.kind in IC else IC['file']
+            name = e.disp + ('/' if e.is_dir else '')
+            meta = ''
+            if show_meta:
+                meta = (f'{"pasta":>8}' if e.is_dir else f'{hsize(e.size):>8}') + '  ' + \
+                       (time.strftime('%d/%m/%y %H:%M', time.localtime(e.mtime)) if e.mtime else ' ' * 14)
+            nw = w - lx - 6 - (len(meta) + 2 if meta else 0)
+            attr = col(c, bg) | (curses.A_BOLD if e.is_dir or selected else 0)
+            put(scr, y, lx + 2, f'{icon} ', col(c, bg))
+            put(scr, y, lx + 4, clip(name, nw) if swidth(name) <= nw else clip(name, nw - 1) + '…', attr)
+            if e.is_dir and self.fav_key(e.path) in self.favs:
+                put(scr, y, lx + 5 + min(swidth(name), nw), IC['star'], col(YELLOW, bg))
+            elif e.is_link:
+                put(scr, y, lx + 5 + min(swidth(name), nw), IC['link'], col(CYAN, bg))
+            if meta:
+                put(scr, y, w - len(meta) - 1, meta, col(GRAY, bg))
+        if len(self.entries) <= (1 if self.cwd != '/' else 0):
+            empty = 'nada aqui' + (f' com "{self.filter}"' if self.filter else '')
+            put(scr, self.list_y + 2, lx + 4, empty, col(GRAY))
+        iy = h - kh - 1
+        fill(scr, iy, col(None, DARK))
+        nd = sum(1 for e in self.all if e.is_dir)
+        left = f' {nd} pastas · {len(self.all) - nd} arquivos'
+        if self.filter:
+            left += f' · filtro: "{self.filter}"'
+        if self.hidden:
+            left += ' · ocultos visíveis'
+        if self.clipboard:
+            mode, src = self.clipboard
+            left += f' · {"copiado" if mode == "copy" else "recortado"}: {safe(os.path.basename(src))}'
+        if self.msg:
+            left = ' ' + self.msg
+        attr = col(self.msg_color, DARK) | curses.A_BOLD if self.msg else col(GRAY, DARK)
+        put(scr, iy, 0, left, attr)
+        e = self.cur
+        if e is not None and w > 70 and swidth(left) < w - 14:
+            right = f'{stat.filemode(e.mode)} '
+            put(scr, iy, w - len(right), right, col(GRAY, DARK))
+        draw_keys(scr, keys)
+        scr.refresh()
+
+    def open(self, e):
+        if e is None:
+            return self.up()
+        if e.is_dir:
+            return self.go(e.path)
+        if e.kind in ('text', 'code') or (e.kind in ('file', 'exec') and looks_text(e.path)):
+            if e.size > Editor.MAX:
+                popup(self.scr, f'{IC["warn"]}  Arquivo grande demais', [f'{e.disp} tem {hsize(e.size)}.',
+                      'O editor do canivt abre até 20M.'])
+                return
+            return self.edit(e.path)
+        if e.kind in KIND_LABEL:
+            lines = [e.disp, '', f'É um arquivo de {KIND_LABEL[e.kind]}, que o canivt não abre.']
+        else:
+            ex = ext_of(e.name)
+            why = f'Extensão ".{ex}" não reconhecida.' if ex else 'Arquivo sem extensão e não é texto.'
+            lines = [e.disp, '', why]
+        lines += ['', 'o  abrir com o programa padrão do sistema']
+        k = popup(self.scr, f'{IC["warn"]}  Não sei abrir este arquivo', lines, ORANGE)
+        if k in ('o', 'O'):
+            self.xdg(e.path)
+
+    def edit(self, path):
+        try:
+            Editor(self, path).run()
+        except OSError as ex:
+            popup(self.scr, f'{IC["warn"]}  Erro', [f'Não foi possível abrir: {ex.strerror}'])
+        self.load(os.path.basename(path))
+
+    def xdg(self, path):
+        subprocess.Popen(['xdg-open', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        self.say(f'Abrindo {os.path.basename(path)} no programa padrão')
+
+    def new(self, folder):
+        name = ask(self.scr, 'Nome da nova pasta:' if folder else 'Nome do novo arquivo:', self.draw)
+        if not name:
+            return
+        path = os.path.join(self.cwd, os.path.expanduser(name))
+        try:
+            if folder:
+                os.makedirs(path)
+            else:
+                if os.path.exists(path):
+                    self.say('Já existe um item com esse nome', RED)
+                    return
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open(path, 'x').close()
+        except OSError as ex:
+            self.say(f'Erro: {ex.strerror}', RED)
+            return
+        self.load(name.split('/')[0])
+        if not folder:
+            self.edit(path)
+
+    def rename(self):
+        e = self.cur
+        if e is None:
+            return
+        name = ask(self.scr, 'Novo nome:', self.draw, e.name)
+        if not name or name == e.name:
+            return
+        dst = os.path.join(self.cwd, name)
+        if os.path.exists(dst):
+            self.say('Já existe um item com esse nome', RED)
+            return
+        try:
+            os.rename(e.path, dst)
+        except OSError as ex:
+            self.say(f'Erro: {ex.strerror}', RED)
+            return
+        old, new = self.fav_key(e.path), self.fav_key(dst)
+        if old in self.favs:
+            self.favs[self.favs.index(old)] = new
+            conf_save('favoritos.json', self.favs)
+        self.say(f'Renomeado para {name}')
+        self.load(name)
+
+    def delete(self):
+        e = self.cur
+        if e is None:
+            return
+        trash = shutil.which('gio') and not smb_mountdir(e.path)  # shares have no trash
+        what = 'a pasta' if e.is_dir else 'o arquivo'
+        if not confirm(self.scr, f'{IC["warn"]}  Excluir?', [f'{what}: {e.disp}', '',
+                       'vai para a lixeira' if trash else 'ATENÇÃO: exclusão permanente']):
+            return
+        try:
+            if trash:
+                r = subprocess.run(['gio', 'trash', e.path], capture_output=True, text=True)
+                if r.returncode:
+                    raise OSError(0, r.stderr.strip() or 'falha ao mover para a lixeira')
+            elif e.is_dir and not e.is_link:
+                shutil.rmtree(e.path)
+            else:
+                os.remove(e.path)
+        except OSError as ex:
+            self.say(f'Erro: {ex.strerror}', RED)
+            return
+        nxt = self.entries[self.sel + 1].name if self.sel + 1 < len(self.entries) else None
+        self.say(f'{e.disp} {"movido para a lixeira" if trash else "excluído"}')
+        self.load(nxt)
+
+    def paste(self):
+        if not self.clipboard:
+            self.say('Nada copiado. Use c (copiar) ou x (recortar) em um item primeiro', ORANGE)
+            return
+        mode, src = self.clipboard
+        if not os.path.lexists(src):
+            self.say('O item copiado não existe mais', RED)
+            self.clipboard = None
+            return
+        base = os.path.basename(src)
+        dst = os.path.join(self.cwd, base)
+        if os.path.abspath(src) == dst and mode == 'cut':
+            self.clipboard = None
+            return
+        stem, ex = os.path.splitext(base) if not os.path.isdir(src) else (base, '')
+        n = 1
+        while os.path.lexists(dst):
+            dst = os.path.join(self.cwd, f'{stem} (cópia{"" if n == 1 else " " + str(n)}){ex}')
+            n += 1
+        if os.path.isdir(src) and (dst + '/').startswith(os.path.abspath(src) + '/'):
+            self.say('Não dá para colar uma pasta dentro dela mesma', RED)
+            return
+        self.busy('Copiando...' if mode == 'copy' else 'Movendo...')
+        try:
+            if mode == 'cut':
+                shutil.move(src, dst)
+                self.clipboard = None
+            elif os.path.isdir(src) and not os.path.islink(src):
+                shutil.copytree(src, dst, symlinks=True)
+            else:
+                shutil.copy2(src, dst, follow_symlinks=False)
+        except (OSError, shutil.Error) as ex:
+            self.say(f'Erro: {getattr(ex, "strerror", None) or ex}', RED)
+            return
+        self.say(f'Colado: {os.path.basename(dst)}')
+        self.load(os.path.basename(dst))
+
+    def filter_mode(self):
+        def change(t):
+            self.filter = t
+            self.apply_filter()
+        if ask(self.scr, 'Filtrar (Enter mantém, Esc limpa):', self.draw, self.filter, change) is None:
+            self.filter = ''
+            self.apply_filter(self.cur.name if self.cur else None)
+
+    def goto_prompt(self):
+        t = ask(self.scr, 'Ir para (pasta ou smb://servidor/compartilhamento):', self.draw,
+                smb_url(self.cwd) or self.cwd + ('/' if self.cwd != '/' else ''))
+        if not t:
+            return
+        if t.startswith('smb://'):
+            return self.open_url(t)
+        p = os.path.abspath(os.path.join(self.cwd, os.path.expanduser(t)))
+        if os.path.isfile(p):
+            self.go(os.path.dirname(p), os.path.basename(p))
+        else:
+            self.go(p)
+
+    def mouse(self):
+        try:
+            _, mx, my, _, b = curses.getmouse()
+        except curses.error:
+            return
+        if b & curses.BUTTON4_PRESSED:
+            self.sel = max(0, self.sel - 3)
+            return
+        if b & curses.BUTTON5_PRESSED:
+            self.sel = min(len(self.entries) - 1, self.sel + 3)
+            return
+        if not b & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+            return
+        if my == 0:
+            for x0, x1, p in self.crumbs:
+                if x0 <= mx < x1:
+                    return self.go(p, self.remember.get(p))
+            return
+        if mx < self.lx:
+            if my in self.side_rows:
+                self.side_action(self.side_rows[my])
+            return
+        j = self.top + my - self.list_y
+        if self.list_y <= my < self.list_y + self.list_rows and j < len(self.entries):
+            now = time.monotonic()
+            dbl = self.last_click[1] == j and now - self.last_click[0] < 0.4
+            self.sel = j
+            self.last_click = (now, j)
+            if dbl:
+                self.last_click = (0, -1)
+                self.open(self.cur)
+
+    def run(self):
+        while True:
+            self.draw()
+            k = read_key(self.scr)
+            if k is None or k == curses.KEY_RESIZE:
+                continue
+            self.msg = ''
+            n = len(self.entries)
+            if k in (curses.KEY_UP, 'k'):
+                self.sel = (self.sel - 1) % n if n else 0
+            elif k in (curses.KEY_DOWN, 'j'):
+                self.sel = (self.sel + 1) % n if n else 0
+            elif k == curses.KEY_PPAGE:
+                self.sel = max(0, self.sel - self.list_rows)
+            elif k == curses.KEY_NPAGE:
+                self.sel = min(n - 1, self.sel + self.list_rows)
+            elif k == curses.KEY_HOME:
+                self.sel = 0
+            elif k == curses.KEY_END:
+                self.sel = n - 1
+            elif k in (curses.KEY_RIGHT, 'l', '\n', '\r', curses.KEY_ENTER):
+                if n:
+                    self.open(self.cur)
+            elif k in (curses.KEY_LEFT, 'h', curses.KEY_BACKSPACE, '\x7f', '\x08'):
+                self.up()
+            elif isinstance(k, str) and k.isdigit():
+                i = (int(k) - 1) % 10
+                targets = self.side_targets()
+                if i < len(targets):
+                    self.side_action(targets[i])
+                else:
+                    self.say(f'Nenhum favorito no {k}. Use f para favoritar uma pasta', ORANGE)
+            elif k == 'f':
+                self.toggle_fav()
+            elif k == 's':
+                self.connect_form()
+            elif k == 'S':
+                self.forget_server()
+            elif k == 'u':
+                self.disconnect()
+            elif k == 'b':
+                self.show_side = not self.show_side
+            elif k == '.':
+                self.hidden = not self.hidden
+                self.load(self.cur.name if self.cur else None)
+                self.say('Mostrando arquivos ocultos' if self.hidden else 'Ocultando arquivos ocultos', CYAN)
+            elif k == '/':
+                self.filter_mode()
+            elif k == '\x1b' and self.filter:
+                self.filter = ''
+                self.apply_filter(self.cur.name if self.cur else None)
+            elif k == '~':
+                self.go(os.path.expanduser('~'))
+            elif k == '\\':
+                self.go('/')
+            elif k == 'g':
+                self.goto_prompt()
+            elif k == 'n':
+                self.new(False)
+            elif k == 'N':
+                self.new(True)
+            elif k in ('r', curses.KEY_F2):
+                self.rename()
+            elif k in ('d', curses.KEY_DC):
+                self.delete()
+            elif k in ('c', 'x') and self.cur is not None:
+                self.clipboard = ('copy' if k == 'c' else 'cut', self.cur.path)
+                self.say(f'{"Copiado" if k == "c" else "Recortado"}: {self.cur.disp}. Cole com v', CYAN)
+            elif k == 'v':
+                self.paste()
+            elif k == 'o' and self.cur is not None:
+                self.xdg(self.cur.path)
+            elif k == curses.KEY_MOUSE:
+                self.mouse()
+            elif k in ('q', '\x11', '\x03'):
+                return
+
+
+def setup(scr):
+    global _rich
+    curses.raw()
+    try:  # let Ctrl+S, Ctrl+Q and Ctrl+V reach us
+        fd = sys.stdin.fileno()
+        a = termios.tcgetattr(fd)
+        a[0] &= ~termios.IXON
+        a[3] &= ~termios.IEXTEN
+        termios.tcsetattr(fd, termios.TCSANOW, a)
+    except termios.error:
+        pass
+    curses.curs_set(0)
+    scr.keypad(True)
+    curses.start_color()
+    curses.use_default_colors()
+    _rich = curses.COLORS >= 256
+    curses.mousemask(FM_MOUSE)
+    curses.mouseinterval(0)
+
+
+USAGE = '''uso: canivt [pasta | arquivo | smb://servidor/compartilhamento]
+
+Gerenciador de arquivos e editor de texto para o terminal, com favoritos
+e acesso a servidores SMB.
+
+  -h, --help      mostra esta ajuda
+  -v, --version   mostra a versão
+
+Variáveis de ambiente:
+  CANIVT_ASCII=1  usa ícones simples (sem Nerd Font)'''
+
+
+def save_lastdir(path):
+    """Lets a shell function cd into the directory canivt was left in."""
+    d = os.path.join(os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache')), 'canivt')
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'lastdir'), 'w') as f:
+            f.write(path)
+    except OSError:
+        pass
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else '.'
+    if arg in ('-h', '--help'):
+        print(USAGE)
+        return
+    if arg in ('-v', '--version'):
+        print(f'canivt {__version__}')
+        return
+    url = arg if arg.startswith('smb://') else None
+    target = os.getcwd() if url else os.path.abspath(os.path.expanduser(arg))
+
+    def run(scr):
+        setup(scr)
+        if os.path.isfile(target):
+            app = App(scr, os.path.dirname(target))
+            app.load(os.path.basename(target))
+            app.open(app.cur)
+        else:
+            app = App(scr, target if os.path.isdir(target) else os.getcwd())
+            if url:
+                app.open_url(url)
+        app.run()
+        return app.cwd
+
+    try:
+        save_lastdir(curses.wrapper(run))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == '__main__':
+    main()
